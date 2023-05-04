@@ -7,6 +7,7 @@ import argparse
 import os
 import math
 import sys
+from tqdm import tqdm
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
@@ -202,9 +203,12 @@ def main():
     assert not args.offload, "zero-offload is not currently supported but coming soon!"
 
     torch.distributed.barrier()
+    fast_tokenizer=True
+    if 'llama' in args.model_name_or_path:
+        fast_tokenizer=False
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path,
-                                              fast_tokenizer=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path,fast_tokenizer=fast_tokenizer)
+    print_rank_0('load tokenizer done!')
     tokenizer.pad_token = tokenizer.eos_token
 
     model = create_hf_model(AutoModelForCausalLM,
@@ -311,10 +315,12 @@ def main():
             f"Beginning of Epoch {epoch+1}/{args.num_train_epochs}, Total Micro Batches {len(train_dataloader)}",
             args.global_rank)
         model.train()
-        for step, batch in enumerate(train_dataloader):
+        epoch_iterator = tqdm(train_dataloader, disable=args.global_rank != 0)
+        for step, batch in enumerate(epoch_iterator):
             batch = to_device(batch, device)
             outputs = model(**batch, use_cache=False)
             loss = outputs.loss
+            epoch_iterator.set_postfix({'loss': loss.item()})  #
             model.backward(loss)
             model.step()
 
