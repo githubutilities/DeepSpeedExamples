@@ -21,7 +21,13 @@ def create_hf_model(model_class,
                     ds_config=None,
                     rlhf_training=False,
                     disable_dropout=False):
-    model_config = AutoConfig.from_pretrained(model_name_or_path)
+    config_class = AutoConfig
+    if 'chatglm' in model_name_or_path:
+        from chatglm_6b.configuration_chatglm import ChatGLMConfig
+        config_class = ChatGLMConfig
+    else:
+        config_class = AutoConfig
+    model_config = config_class.from_pretrained(model_name_or_path, trust_remote_code=True)
     if disable_dropout:
         model_config.dropout = 0.0
     # Note: dschf is defined in function scope to avoid global effects
@@ -37,7 +43,9 @@ def create_hf_model(model_class,
         model = model_class.from_pretrained(
             model_name_or_path,
             from_tf=bool(".ckpt" in model_name_or_path),
-            config=model_config)
+            trust_remote_code=True,
+            config=model_config,
+            )
 
     model.config.end_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = model.config.eos_token_id

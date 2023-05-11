@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
+import os
+import json
 from datasets import load_dataset
 from torch.utils.data import Subset
 import re
@@ -41,6 +43,40 @@ class PromptRawDataset(object):
 
     def get_prompt_and_rejected(self, sample):
         return
+
+
+# Sft dataset
+class SftDataset(PromptRawDataset):
+
+    def __init__(self, output_path, seed, local_rank, dataset_name):
+        super().__init__(output_path, seed, local_rank, dataset_name)
+        with open(os.path.join(dataset_name, 'train.json')) as f:
+            self.train_data = [json.loads(l) for l in f]
+        with open(os.path.join(dataset_name, 'test.json')) as f:
+            self.test_data = [json.loads(l) for l in f]
+        self.dataset_name = os.path.basename(dataset_name)
+        self.dataset_name_clean = os.path.basename(dataset_name)
+
+    def get_train_data(self):
+        return self.train_data
+
+    def get_eval_data(self):
+        return self.test_data
+
+    def get_prompt(self, sample):
+        return 'Human: ' + sample['instruction'] + '\n'
+
+    def get_chosen(self, sample):
+        return 'Assistant: ' + sample['chosen']
+
+    def get_rejected(self, sample):
+        return sample['rejected']
+
+    def get_prompt_and_chosen(self, sample):
+        return self.get_prompt(sample) + self.get_chosen(sample)
+
+    def get_prompt_and_rejected(self, sample):
+        return self.get_prompt(sample) + self.get_rejected(sample)
 
 
 # English dataset
