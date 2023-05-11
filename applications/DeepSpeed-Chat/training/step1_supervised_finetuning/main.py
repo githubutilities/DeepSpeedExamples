@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from transformers import (
+    AutoModel,
     AutoModelForCausalLM,
     AutoTokenizer,
     SchedulerType,
@@ -199,19 +200,32 @@ def main():
 
     # If passed along, set the training seed now.
     set_random_seed(args.seed)
+    print_rank_0('random seed set!')
 
     assert not args.offload, "zero-offload is not currently supported but coming soon!"
 
     torch.distributed.barrier()
-    fast_tokenizer=True
+    print_rank_0('after barrier!')
+    model_class = AutoModelForCausalLM
+    tokenizer_class = AutoTokenizer 
+    tok_params = {}
     if 'llama' in args.model_name_or_path:
-        fast_tokenizer=False
+        tok_params['fast_tokenizer'] = False
+    if 'chatglm' in args.model_name_or_path:
+        from chatglm_6b.tokenization_chatglm import ChatGLMTokenizer
+        from chatglm_6b.modeling_chatglm import ChatGLMForConditionalGeneration
+        tokenizer_class = ChatGLMTokenizer
+        model_class = ChatGLMForConditionalGeneration
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path,fast_tokenizer=fast_tokenizer)
+    tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, trust_remote_code=True, **tok_params)
     print_rank_0('load tokenizer done!')
-    tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is None:
+        print(tokenizer.eos_token, tokenizer.eos_token_id)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        print(tokenizer.pad_token, tokenizer.pad_token_id)
 
-    model = create_hf_model(AutoModelForCausalLM,
+    model = create_hf_model(model_class,
                             args.model_name_or_path,
                             tokenizer,
                             ds_config,
@@ -251,6 +265,10 @@ def main():
                                  collate_fn=default_data_collator,
                                  sampler=eval_sampler,
                                  batch_size=args.per_device_eval_batch_size)
+    for idx, e in enumerate(train_dataloader):
+        if idx < 10:
+            print(idx, e)
+
 
     def evaluation(model, eval_dataloader):
         model.eval()
@@ -324,6 +342,13 @@ def main():
             model.backward(loss)
             model.step()
 
+        if args.zero_stage == 3:
+            # For zero stage 3, each gpu only has a part of the model, so we need a special save function
+            save_zero_three_model(model,
+                                  args.global_rank,
+                                  args.output_dir,
+                                  zero_stage=args.zero_stage)
+
         # Evaluate perplexity on the validation set.
         print_rank_0(
             f"***** Evaluating perplexity, Epoch {epoch+1}/{args.num_train_epochs} *****",
@@ -333,7 +358,7 @@ def main():
         model.tput_timer.update_epoch_count()
 
     if args.output_dir is not None:
-        print_rank_0('saving the final model ...', args.global_rank)
+        print_rank_0('saving the final model ...', args.global_rank, args.output_dir)
         model = convert_lora_to_linear_layer(model)
 
         if args.global_rank == 0:
@@ -345,6 +370,9 @@ def main():
                                   args.global_rank,
                                   args.output_dir,
                                   zero_stage=args.zero_stage)
+
+        torch.distributed.barrier()
+        print_rank_0('saved the final model ...', args.global_rank, args.output_dir)
 
 
 if __name__ == "__main__":
