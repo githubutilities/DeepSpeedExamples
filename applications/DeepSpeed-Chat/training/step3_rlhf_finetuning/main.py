@@ -19,6 +19,7 @@ for prompt_batch in prompt_train_dataloader:
 import argparse
 import os
 import random
+import time
 import torch
 from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -29,6 +30,7 @@ from transformers import (
     default_data_collator,
 )
 
+import tqdm
 import deepspeed
 
 from ppo_trainer import DeepSpeedPPOTrainer, DeepSpeedPPOTrainerUnsupervised
@@ -129,11 +131,11 @@ def parse_args():
         help="For generated data, how many ppo training epochs to run.")
     parser.add_argument("--max_prompt_seq_len",
                         type=int,
-                        default=256,
+                        default=192,
                         help="The maximum sequence length.")
     parser.add_argument("--max_answer_seq_len",
                         type=int,
-                        default=256,
+                        default=300,
                         help="The maximum sequence length.")
     parser.add_argument(
         "--actor_learning_rate",
@@ -197,6 +199,41 @@ def parse_args():
                         type=int,
                         default=-1,
                         help="local_rank for distributed training on gpus")
+    parser.add_argument(
+        "--prompt_answer",
+        action='store_true',
+        default=False,
+    )
+    parser.add_argument(
+        "--use_manual_reward",
+        action='store_true',
+        default=False,
+    )
+    parser.add_argument(
+        "--use_whiten",
+        action='store_true',
+        default=False,
+    )
+    parser.add_argument(
+        "--use_scale_reward",
+        action='store_true',
+        default=False,
+    )
+    parser.add_argument(
+        "--scale_reward_std",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--scale_reward_mean",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--load_alpaca_reward_model",
+        action='store_true',
+        default=False,
+    )
 
     # DeepSpeed
     parser.add_argument(
@@ -223,6 +260,11 @@ def parse_args():
         default=1,
         help=
         "Tensor-parallelism degree used for the inference-optimization. Please note hybrid-engine need to be enabled when using this feature."
+    )
+    parser.add_argument(
+        "--save_per_step",
+        type=int,
+        default=15,
     )
     parser.add_argument(
         "--tp_gather_partition_size",
@@ -298,12 +340,47 @@ def parse_args():
             not args.only_optimize_lora
         ), "--{actor,critic}_gradient_checkpointing and --only_optimize_lora cannot be enabled at the same time."
 
+    print('args.inference_tp_size', args.inference_tp_size)
+    print('args.actor_zero_stage', args.actor_zero_stage)
     if args.inference_tp_size > 1:
         assert (
             args.actor_zero_stage == 3
         ), "Zero stage 3 must be used to do Tensor sharding in the hybrid engine"
 
     return args
+
+
+def save_rlhf_models(rlhf_engine, tokenizer, output_dir, args):
+    if torch.distributed.get_rank() == 0:
+        save_hf_format(rlhf_engine.actor,
+                       tokenizer,
+                       save_dir=os.path.join(output_dir, "actor"))
+        save_hf_format(rlhf_engine.critic,
+                       tokenizer,
+                       save_dir=os.path.join(output_dir, "actor_ema"))
+        if args.enable_ema:
+            save_hf_format(rlhf_engine.actor_ema,
+                           tokenizer,
+                           save_dir=os.path.join(output_dir, "critic"))
+
+    if args.actor_zero_stage == 3:
+        save_zero_three_model(rlhf_engine.actor,
+                              global_rank=args.global_rank,
+                              save_dir=os.path.join(
+                                  output_dir, 'actor'),
+                              zero_stage=args.actor_zero_stage)
+        if args.enable_ema:
+            save_zero_three_model(rlhf_engine.actor_ema,
+                                  global_rank=args.global_rank,
+                                  save_dir=os.path.join(
+                                      output_dir, 'actor_ema'),
+                                  zero_stage=args.actor_zero_stage)
+    if args.critic_zero_stage == 3:
+        save_zero_three_model(rlhf_engine.critic,
+                              global_rank=args.global_rank,
+                              save_dir=os.path.join(
+                                  output_dir, 'critic'),
+                              zero_stage=args.critic_zero_stage)
 
 
 def create_datasets(args, tokenizer, train_phase=3):
@@ -366,7 +443,7 @@ def main():
 
     args.global_rank = torch.distributed.get_rank()
 
-    assert not args.offload, "zero-offload is not currently supported but coming soon!"
+    #assert not args.offload, "zero-offload is not currently supported but coming soon!"
 
     unsupervised_training_enabled = args.unsupervised_dataset_name and args.unsupervised_dataset_config_name
     if unsupervised_training_enabled:
@@ -382,7 +459,9 @@ def main():
     # create common tokenizer based on actor model
     tokenizer = AutoTokenizer.from_pretrained(args.actor_model_name_or_path,
                                               fast_tokenizer=True)
-    tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'
 
     prompt_train_dataloader, unsupervised_train_dataloader, num_total_iters = create_datasets(
         args=args, tokenizer=tokenizer, train_phase=3)
@@ -395,7 +474,7 @@ def main():
         num_total_iters=num_total_iters,
         args=args)
 
-    args.end_of_conversation_token = "<|endoftext|>"
+    args.end_of_conversation_token = ""
 
     ppo_trainer = DeepSpeedPPOTrainerUnsupervised if unsupervised_training_enabled else DeepSpeedPPOTrainer
     trainer = ppo_trainer(rlhf_engine, args)
@@ -413,8 +492,12 @@ def main():
         print_rank_0(
             f"Beginning of Epoch {epoch+1}/{args.num_train_epochs}, Total Generation Batches {min(len(prompt_train_dataloader), len(unsupervised_train_dataloader))}",
             args.global_rank)
-        for step, (batch_prompt, batch_unsupervised) in enumerate(
-                zip(prompt_train_dataloader, unsupervised_train_dataloader)):
+        for step, (batch_prompt, batch_unsupervised) in tqdm.tqdm(
+            enumerate(zip(prompt_train_dataloader, unsupervised_train_dataloader)),
+            disable=torch.distributed.get_rank() != 0,
+            desc="total_step",
+        ):
+            print_rank_0("Time before to_device: {}".format(int(time.time())), args.global_rank)
             batch_prompt = to_device(batch_prompt, device)
             if batch_unsupervised is not None:
                 batch_unsupervised = to_device(batch_unsupervised, device)
@@ -422,13 +505,16 @@ def main():
             else:
                 unsup_dataset = unsup_mini_dataset.add(
                     [[None] * args.per_device_train_batch_size])
-            prompts = batch_prompt['prompt']
-            length = prompts.size(-1)
-            if length > args.max_prompt_seq_len:
-                prompts = prompts[:, length - args.max_prompt_seq_len:]
-                raise ValueError("Prompt length is too long")
+            #prompts = batch_prompt['prompt']
+            #length = prompts.size(-1)
+            #if length > args.max_prompt_seq_len:
+            #    prompts = prompts[:, length - args.max_prompt_seq_len:]
+            #    raise ValueError("Prompt length is too long")
 
-            out = trainer.generate_experience(prompts)
+            print_rank_0("Time before generate_exp: {}".format(int(time.time())), args.global_rank)
+            out = trainer.generate_experience(batch_prompt['prompt'],
+                batch_prompt['prompt_att_mask'], step_idx=step)
+            print_rank_0("Time after generate_exp: {}".format(int(time.time())), args.global_rank)
             exp_dataset = exp_mini_dataset.add(out)
 
             if exp_dataset is not None:
@@ -439,13 +525,35 @@ def main():
                 if args.actor_gradient_checkpointing:
                     rlhf_engine.actor.gradient_checkpointing_enable()
 
+                update_per_step = 1000000
                 for ppo_ep in range(args.ppo_epochs):
-                    for i, (exp_data, unsup_data) in enumerate(
-                            zip(exp_dataset, unsup_dataset)):
+                    for i, (exp_data, unsup_data) in tqdm.tqdm(
+                            enumerate(zip(exp_dataset, unsup_dataset)),
+                            disable=torch.distributed.get_rank() != 0,
+                            desc="train_step",
+                    ):
+                        print_rank_0("exp: i {}".format(i), args.global_rank)
+                        print_rank_0("Time before train_rlhf: {}".format(int(time.time())), args.global_rank)
                         actor_loss, critic_loss = trainer.train_rlhf(exp_data)
+                        print_rank_0("cur_actor_loss: {}".format(actor_loss), args.global_rank)
+                        print_rank_0("cur_critic_loss: {}".format(critic_loss), args.global_rank)
+                        print_rank_0("Time after train_rlhf: {}".format(int(time.time())), args.global_rank)
                         actor_loss_sum += actor_loss.item()
                         critic_loss_sum += critic_loss.item()
-                        average_reward += exp_data["rewards"].mean()
+                        cur_reward_score = exp_data["rewards"].mean()
+                        print_rank_0("cur_reward_score: {}".format(cur_reward_score),
+                            args.global_rank)
+                        # clip cur reward
+                        #cur_reward_score = max(cur_reward_score, -1.0)
+                        average_reward += cur_reward_score
+         
+                        #if i > 0 and i % update_per_step == 0:
+                        if False:
+                            print_rank_0("Time before copy_model: {}".format(int(time.time())), args.global_rank)
+                            copy_model(rlhf_engine.actor,
+                                           rlhf_engine.ref,
+                                           zero_stage=args.actor_zero_stage)
+                            print_rank_0("Time after copy_model: {}".format(int(time.time())), args.global_rank)
 
                         if unsupervised_training_enabled:
                             unsup_loss = trainer.train_unsupervised(
@@ -475,6 +583,10 @@ def main():
             if args.actor_gradient_checkpointing:
                 rlhf_engine.actor.gradient_checkpointing_disable()
 
+            if step == 1 or step % args.save_per_step == 0:
+                output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(step))
+                save_rlhf_models(rlhf_engine, tokenizer, output_dir, args)
+
     if args.output_dir is not None:
         print_rank_0('saving model ...')
         rlhf_engine.actor = convert_lora_to_linear_layer(rlhf_engine.actor)
@@ -483,40 +595,9 @@ def main():
             rlhf_engine.actor_ema = convert_lora_to_linear_layer(
                 rlhf_engine.actor_ema)
 
-        if torch.distributed.get_rank() == 0:
-            save_hf_format(rlhf_engine.actor,
-                           tokenizer,
-                           args,
-                           sub_folder='actor')
-            save_hf_format(rlhf_engine.critic,
-                           tokenizer,
-                           args,
-                           sub_folder='critic')
-            if args.enable_ema:
-                save_hf_format(rlhf_engine.actor_ema,
-                               tokenizer,
-                               args,
-                               sub_folder='actor_ema')
-
-        if args.actor_zero_stage == 3:
-            save_zero_three_model(rlhf_engine.actor,
-                                  global_rank=args.global_rank,
-                                  save_dir=os.path.join(
-                                      args.output_dir, 'actor'),
-                                  zero_stage=args.actor_zero_stage)
-            if args.enable_ema:
-                save_zero_three_model(rlhf_engine.actor_ema,
-                                      global_rank=args.global_rank,
-                                      save_dir=os.path.join(
-                                          args.output_dir, 'actor_ema'),
-                                      zero_stage=args.actor_zero_stage)
-        if args.critic_zero_stage == 3:
-            save_zero_three_model(rlhf_engine.critic,
-                                  global_rank=args.global_rank,
-                                  save_dir=os.path.join(
-                                      args.output_dir, 'critic'),
-                                  zero_stage=args.critic_zero_stage)
-
+        output_dir = os.path.join(args.output_dir, "checkpoint-final")
+        save_rlhf_models(rlhf_engine, tokenizer, output_dir, args)
 
 if __name__ == "__main__":
     main()
+

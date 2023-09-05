@@ -129,7 +129,7 @@ class PromptDataset(Dataset):
             return {
                 "input_ids": self.chosen_dataset[idx]["input_ids"],
                 "attention_mask": self.chosen_dataset[idx]["attention_mask"],
-                "labels": self.chosen_dataset[idx]["input_ids"]
+                "labels": self.chosen_dataset[idx]["labels"]
             }
         elif self.train_phase == 2:
             return self.chosen_dataset[idx]["input_ids"], self.chosen_dataset[idx]["attention_mask"], \
@@ -149,6 +149,8 @@ def create_dataset_split(current_dataset, raw_dataset, train_phase, tokenizer,
             # tokenize the text
             chosen_sentence = raw_dataset.get_prompt_and_chosen(
                 tmp_data)  # the accept response
+            prompt_sentence = raw_dataset.get_prompt(
+                tmp_data)  # the accept response
             if chosen_sentence is not None:
                 chosen_sentence += end_of_conversation_token
                 chosen_token = tokenizer(chosen_sentence,
@@ -156,6 +158,17 @@ def create_dataset_split(current_dataset, raw_dataset, train_phase, tokenizer,
                                          padding="max_length",
                                          truncation=True,
                                          return_tensors="pt")
+
+                prompt_token = tokenizer(prompt_sentence,
+                                         max_length=max_seq_len,
+                                         padding="max_length",
+                                         truncation=True,
+                                         return_tensors="pt")
+                prompt_input_ids = prompt_token.input_ids# * prompt_token.attention_mask
+                # Mask掉Prompt
+                labels = torch.where(prompt_input_ids == chosen_token.input_ids, -100, chosen_token.input_ids)
+                chosen_token["labels"] = labels.squeeze(0)
+
                 chosen_token["input_ids"] = chosen_token["input_ids"].squeeze(
                     0)
                 chosen_token["attention_mask"] = chosen_token[
@@ -249,7 +262,8 @@ def create_prompt_dataset(local_rank,
                           seed,
                           tokenizer,
                           max_seq_len,
-                          end_of_conversation_token="<|endoftext|>",
+                          #end_of_conversation_token="<|endoftext|>",
+                          end_of_conversation_token="",
                           sft_only_data_path=[]):
     """
     Creates the prompt dataset
@@ -266,6 +280,7 @@ def create_prompt_dataset(local_rank,
     eval_fname = f"{output_path}/evaldata_{fname}.pt"
 
     cache_found = os.path.isfile(train_fname) and os.path.isfile(eval_fname)
+    #cache_found = False
     buf_create_cache = torch.ByteTensor([not cache_found]).cuda()
     torch.distributed.all_reduce(buf_create_cache)
 
@@ -368,11 +383,11 @@ class DataCollatorRLHF:
         pad_length = self.max_token_len - length
         if pad_length > 0:
             batch["prompt"] = F.pad(prompt,
-                                    pad=(pad_length, 0),
+                                    pad=(0, pad_length),
                                     mode='constant',
                                     value=pad_token_id)
             batch["prompt_att_mask"] = F.pad(prompt_mask,
-                                             pad=(pad_length, 0),
+                                             pad=(0, pad_length),
                                              mode='constant',
                                              value=0)
         else:
@@ -420,7 +435,8 @@ def get_unsupervised_data(args, tokenizer):
             [t[i:i + block_size] for i in range(0, total_length, block_size)]
             for k, t in concatenated_examples.items()
         }
-        result["labels"] = result["input_ids"].copy()
+        if "labels" not in result:
+            result["labels"] = result["input_ids"].copy()
         return result
 
     lm_datasets = tokenized_datasets.map(

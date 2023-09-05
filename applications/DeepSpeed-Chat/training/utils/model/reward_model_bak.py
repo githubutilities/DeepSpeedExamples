@@ -4,18 +4,15 @@
 # DeepSpeed Team
 import torch
 from torch import nn
-from transformers import PreTrainedModel, AutoConfig
-from transformers.models.llama import LlamaModel, LlamaForCausalLM
 
 
 ## Note that the following code is modified from
 ## https://github.com/CarperAI/trlx/blob/main/examples/summarize_rlhf/reward_model/reward_model.py
-class RewardModel(PreTrainedModel):
-    config_class = AutoConfig
+class RewardModelBak(nn.Module):
 
-    def __init__(self, config, tokenizer=None, base_model=None, num_padding_at_beginning=0, **kwargs):
-        super().__init__(config)
-        #self.config = base_model.config
+    def __init__(self, base_model, tokenizer, num_padding_at_beginning=0):
+        super().__init__()
+        self.config = base_model.config
         self.num_padding_at_beginning = num_padding_at_beginning
         if hasattr(self.config, "word_embed_proj_dim"):
             # `OPT` models use word_embed_proj_dim as final output
@@ -28,10 +25,7 @@ class RewardModel(PreTrainedModel):
             self.config.n_embd = self.config.hidden_size if hasattr(
                 self.config, "hidden_size") else self.config.n_embd
             self.reward_head = nn.Linear(self.config.n_embd, 1, bias=False)
-        if base_model is not None:
-            self.backbone_model = base_model
-        else:
-            self.backbone_model = LlamaForCausalLM(config)
+        self.backbone_model = base_model
         self.PAD_ID = tokenizer.pad_token_id
 
     def gradient_checkpointing_enable(self):
@@ -54,7 +48,6 @@ class RewardModel(PreTrainedModel):
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
-            #head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache)
 
@@ -127,6 +120,7 @@ class RewardModel(PreTrainedModel):
                       return_value_only=False,
                       prompt_length=0,
                       use_cache=False,
+                      norm_values=True,
                       ):
 
         transformer_outputs = self.backbone_model.model(
@@ -138,6 +132,8 @@ class RewardModel(PreTrainedModel):
             use_cache=use_cache)
         hidden_states = transformer_outputs[0]
         values = self.reward_head(hidden_states).squeeze(-1)
+        if norm_values:
+            values = torch.sigmoid(values)
         if return_value_only:
             return values
         else:

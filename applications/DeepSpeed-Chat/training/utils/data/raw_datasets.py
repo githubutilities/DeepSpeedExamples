@@ -52,8 +52,10 @@ class SftDataset(PromptRawDataset):
         super().__init__(output_path, seed, local_rank, dataset_name)
         with open(os.path.join(dataset_name, 'train.json')) as f:
             self.train_data = [json.loads(l) for l in f]
+            self.train_data = [e for e in self.train_data if e['chosen'] is not None]
         with open(os.path.join(dataset_name, 'test.json')) as f:
             self.test_data = [json.loads(l) for l in f]
+            self.test_data = [e for e in self.test_data if e['chosen'] is not None]
         self.dataset_name = os.path.basename(dataset_name)
         self.dataset_name_clean = os.path.basename(dataset_name)
 
@@ -64,10 +66,10 @@ class SftDataset(PromptRawDataset):
         return self.test_data
 
     def get_prompt(self, sample):
-        return 'Human: ' + sample['instruction'] + '\n'
+        return sample['instruction']
 
     def get_chosen(self, sample):
-        return 'Assistant: ' + sample['chosen']
+        return sample['chosen']
 
     def get_rejected(self, sample):
         return sample['rejected']

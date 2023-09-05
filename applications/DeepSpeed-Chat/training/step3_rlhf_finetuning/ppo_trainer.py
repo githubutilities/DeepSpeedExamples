@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
+import time
 import torch
 import torch.nn.functional as F
 import sys
@@ -12,6 +13,8 @@ from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
+import pandas as pd
+from alpaca_farm import torch_ops
 from utils.utils import print_rank_0
 
 
@@ -56,23 +59,90 @@ class DeepSpeedPPOTrainer():
         self.max_answer_seq_len = args.max_answer_seq_len
         self.end_of_conversation_token_id = self.tokenizer(
             args.end_of_conversation_token)['input_ids'][-1]
+        self.z3_enabled = args.actor_zero_stage == 3
 
         # Those value can be changed
-        self.kl_ctl = 0.02
-        self.clip_reward_value = 5
+        self.kl_ctl = 0.2
+        #self.kl_ctl = 0.1
+        self.vf_coef = 0.1
+        self.clip_reward_value = 1
         self.cliprange = 0.2
         self.cliprange_value = 0.2
         self.gamma = 1.0
-        self.lam = 0.95
+        #self.lam = 0.95
+        self.lam = 1.0
+        self.prompt_answer = args.prompt_answer
 
-    def _generate_sequence(self, prompts):
+    def _generate_sequence(self, prompts, mask):
 
         max_min_length = self.max_answer_seq_len + prompts.shape[1]
 
+        import os
+        if 'RANK' not in os.environ:
+            print('set rank')
+            os.environ['RANK'] = self.args.global_rank
         with torch.no_grad():
+            #print('prompts', prompts)
             seq = self.actor_model.module.generate(prompts,
-                                                   max_length=max_min_length,
-                                                   min_length=max_min_length)
+            #seq = self.ref_model.module.generate(prompts,
+                attention_mask=mask,
+                max_length=max_min_length,
+                #min_length=max_min_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                synced_gpus=self.z3_enabled,
+                top_p=1.0,
+                top_k=0,
+                temperature=1.0,
+            )
+
+            print_rank_0(prompts, self.args.global_rank, prompts.shape)
+            print_rank_0(seq, self.args.global_rank, seq.shape)
+            result = self.tokenizer.batch_decode(seq,
+                                            skip_special_tokens=True,
+                                            clean_up_tokenization_spaces=False)
+            print(result)
+            device = seq.device
+            if self.prompt_answer:
+                seq = self.tokenizer(
+                    result,
+                    max_length=seq.shape[1],
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt")['input_ids'].to(device)
+            else:
+                enable_prompt_pad_answer_pad = False
+                # answer pad pad
+                self.tokenizer.padding_side = 'right'
+                seq = self.tokenizer(
+                    [e.split('Assistant: ')[-1] for e in result],
+                    max_length=self.max_answer_seq_len + 1,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt")['input_ids'][:, 1:].to(device)
+                if enable_prompt_pad_answer_pad:
+                    # shift to right pad: pad prompt
+                    roll_list = []
+                    for a, b in zip(prompts.cpu(), (mask.sum(1) - prompts.shape[1]).cpu().numpy()):
+                        roll_list.append(torch.roll(a, b, dims=0))
+                    prompts = torch.stack(roll_list, axis=0).to(device)
+                seq = torch.cat([prompts, seq], dim=1)
+            self.tokenizer.padding_side = 'left'
+            print_rank_0('after_seq: ' + str(seq), self.args.global_rank)
+
+            def _is_correct(ans):
+                ans = ans.strip()
+                ans_sp = ans.lstrip('Human: ').split(self.args.end_of_conversation_token)[0].split('Assistant:')
+                if len(ans_sp) != 2:
+                    return 0
+                true = eval(ans_sp[0])
+                pred = int(ans_sp[1].strip())
+                return int(true == pred)
+            try:
+                correct = torch.tensor([_is_correct(res) for res in result], device=device)
+                torch.distributed.all_reduce(correct, op=torch.distributed.ReduceOp.SUM)
+                print_rank_0('correct: ' + str(correct), self.args.global_rank)
+            except Exception as e:
+                print_rank_0("error:" + str(e), self.args.global_rank)
 
         # Filter out seq with no answers (or very short). This happens when users directly use the pre-training ckpt without supervised finetuning
         # NOTE: this will causes each GPU has different number of examples
@@ -81,63 +151,163 @@ class DeepSpeedPPOTrainer():
         ans = seq[:, prompt_length:]
         self.prompt_length = prompt_length
         valid_ans_len = (ans != self.tokenizer.pad_token_id).sum(dim=-1)
-        out_seq = []
-        for i in range(batch_size):
-            if valid_ans_len[
-                    i] <= 1:  # if the answer is shorter than 1 token, drop it
-                continue
-            else:
-                out_seq.append(seq[i:i + 1])
-        out_seq = torch.cat(out_seq, dim=0)  # concate output in the batch dim
+        if False:
+            out_seq = []
+            for i in range(batch_size):
+                if valid_ans_len[
+                        i] <= 1:  # if the answer is shorter than 1 token, drop it
+                    continue
+                else:
+                    out_seq.append(seq[i:i + 1])
+            out_seq = torch.cat(out_seq, dim=0)  # concate output in the batch dim
+        else:
+            out_seq = seq
 
-        return out_seq
+        return {
+            "seq": out_seq, 
+        }
 
-    def generate_experience(self, prompts):
+    def generate_experience(self, prompts, mask, step_idx=0):
+        print_rank_0(prompts, self.args.global_rank)
+        print_rank_0(mask, self.args.global_rank)
         self.eval()
-        seq = self._generate_sequence(prompts)
-        self.train()
+        print_rank_0("Time before generate_seq: {}".format(int(time.time())), self.args.global_rank)
+        gen_output = self._generate_sequence(prompts, mask)
+        seq = gen_output["seq"]
+        print_rank_0("Time after generate_seq: {}".format(int(time.time())), self.args.global_rank)
 
         pad_token_id = self.tokenizer.pad_token_id
+        print_rank_0('gen exp prompt' + str(prompts), self.args.global_rank)
+        print_rank_0('gen exp mask' + str(mask), self.args.global_rank)
         attention_mask = seq.not_equal(pad_token_id).long()
+        print_rank_0('gen exp attention_mask' + str(attention_mask), self.args.global_rank)
 
         with torch.no_grad():
+            print_rank_0("Time before actor_model: {}".format(int(time.time())), self.args.global_rank)
             output = self.actor_model(seq, attention_mask=attention_mask)
+            print_rank_0("Time before ref_model: {}".format(int(time.time())), self.args.global_rank)
             output_ref = self.ref_model(seq, attention_mask=attention_mask)
-            reward_score = self.reward_model.forward_value(
-                seq, attention_mask,
-                prompt_length=self.prompt_length)['chosen_end_scores'].detach(
-                )
+            print_rank_0("Time before reward_model: {}".format(int(time.time())), self.args.global_rank)
+            if self.prompt_answer:
+                reward_score = self.reward_model.forward_value(
+                    seq, attention_mask,
+                    prompt_length=seq.shape[1])['chosen_end_scores'].detach(
+                    )
+            else:
+                reward_score = self.reward_model.forward_value(
+                    seq, attention_mask,
+                    prompt_length=self.prompt_length)['chosen_end_scores'].detach(
+                    )
+
+            if self.args.use_scale_reward:
+                reward_score = (reward_score - self.args.scale_reward_mean) / self.args.use_scale_std
+
+            print_rank_0("Time before critic_model: {}".format(int(time.time())), self.args.global_rank)
             values = self.critic_model.forward_value(
                 seq, attention_mask, return_value_only=True).detach()[:, :-1]
+            if self.args.use_scale_reward:
+                values = (values - self.args.scale_reward_mean) / self.args.use_scale_std
+ 
+            print_rank_0("Time after critic_model: {}".format(int(time.time())), self.args.global_rank)
+        self.train()
 
         logits = output.logits
         logits_ref = output_ref.logits
 
+        if self.args.global_rank == 0:
+            rollouts_to_disk = {
+                k: self.tokenizer.batch_decode(
+                    tensor, skip_special_tokens=False, clean_up_tokenization_spaces=False
+                )
+                for k, tensor in [
+                    ('prompt', prompts),
+                    ('seq', seq),
+                ]
+            }
+            rollouts_to_disk = pd.DataFrame(rollouts_to_disk).to_dict(orient="records")
+            from alpaca_farm.utils import jdump
+            jdump(rollouts_to_disk, os.path.join(self.args.output_dir, "rollouts", f"step_{step_idx}.json"))
+
         return {
             'prompts': prompts,
             'logprobs': gather_log_probs(logits[:, :-1, :], seq[:, 1:]),
-            'ref_logprobs': gather_log_probs(logits_ref[:, :-1, :], seq[:,
-                                                                        1:]),
+            'ref_logprobs': gather_log_probs(logits_ref[:, :-1, :], seq[:, 1:]),
             'value': values,
             'rewards': reward_score,
             'input_ids': seq,
-            "attention_mask": attention_mask
+            "attention_mask": attention_mask,
         }
 
-    def compute_rewards(self, prompts, log_probs, ref_log_probs, reward_score,
+    def compute_rewards(self, prompts, seq, log_probs, ref_log_probs, reward_score,
                         action_mask):
 
+        print_rank_0('prompt' + str(prompts), self.args.global_rank)
+        for e in seq:
+            e = self.tokenizer.convert_ids_to_tokens(e)
+            print_rank_0('seq_e' + str(e), self.args.global_rank)
+
+        if self.args.use_manual_reward:
+            result = self.tokenizer.batch_decode(seq,
+                                            skip_special_tokens=True,
+                                            clean_up_tokenization_spaces=False)
+
+            def _is_correct(ans):
+                ans = ans.strip()
+                ans_sp = ans.lstrip('Human: ').split(self.args.end_of_conversation_token)[0].split('Assistant:')
+                if len(ans_sp) != 2:
+                    return 0
+                true = eval(ans_sp[0])
+                pred = int(ans_sp[1].strip())
+                return int(true == pred)
+            try:
+                device = seq.device
+                correct = torch.tensor([_is_correct(res) for res in result], device=device)
+                correct_all_reduce = correct.clone()
+                torch.distributed.all_reduce(correct_all_reduce, op=torch.distributed.ReduceOp.SUM)
+                print_rank_0('correct_all_reduce_list: ' + str(correct_all_reduce), self.args.global_rank)
+                print_rank_0('correct: {}'.format(correct_all_reduce.sum()), self.args.global_rank)
+                #reward_score = correct
+            except Exception as e:
+                print_rank_0("error:" + str(e), self.args.global_rank)
+
         kl_divergence_estimate = -self.kl_ctl * (log_probs - ref_log_probs)
-        rewards = kl_divergence_estimate
-        start = prompts.shape[1] - 1
-        ends = start + action_mask[:, start:].sum(1)
+        #kl_divergence_estimate = -self.kl_ctl * torch.clamp(log_probs - ref_log_probs, min=0.0)
+
+        rewards = kl_divergence_estimate.clone()
+        if self.prompt_answer:
+            # left padding
+            start = 0
+            ends = 0
+        else:
+            start = prompts.shape[1] - 1
+            ends = start + action_mask[:, start:].sum(1) + 1
+        print_rank_0('reward_score' + str(reward_score), self.args.global_rank)
+        print_rank_0('start' + str(start), self.args.global_rank)
+        print_rank_0('ends' + str(ends), self.args.global_rank)
         reward_clip = torch.clamp(reward_score, -self.clip_reward_value,
                                   self.clip_reward_value)
         batch_size = log_probs.shape[0]
-        for j in range(batch_size):
-            rewards[j, start:ends[j]][-1] += reward_clip[j]
+        if self.prompt_answer:
+            rewards[list(range(reward_score.size(0))), -1] += reward_clip
+            #for j in range(batch_size):
+            #    rewards[j, start[j]:][-1] += reward_clip[j]
+        else:
+            #rewards[list(range(reward_score.size(0))), ends - 1] += reward_clip
+            for j in range(batch_size):
+                rewards[j, start:ends[j]][-1] += reward_clip[j]
 
-        return rewards
+        print_rank_0('reward' + str(rewards), self.args.global_rank)
+
+        kl = torch.clamp(log_probs - ref_log_probs, min=0.0)
+        non_score_rewards = -self.kl_ctl * kl
+        shaped_rewards = non_score_rewards.clone()
+ 
+        return dict(
+            shaped_rewards=shaped_rewards,
+            non_score_rewards=non_score_rewards,
+            kl=kl,
+            rewards=rewards,
+        )
 
     def train_rlhf(self, inputs):
         # train the rlhf mode here
@@ -152,44 +322,133 @@ class DeepSpeedPPOTrainer():
 
         start = prompts.size()[-1] - 1
         action_mask = attention_mask[:, 1:]
+        print_rank_0('attention_mask' + str(attention_mask), self.args.global_rank)
 
         old_values = values
         with torch.no_grad():
-            old_rewards = self.compute_rewards(prompts, log_probs,
+            rollouts = self.compute_rewards(prompts, seq, log_probs,
                                                ref_log_probs, reward_score,
                                                action_mask)
-            advantages, returns = self.get_advantages_and_returns(
-                old_values, old_rewards, start)
+            old_rewards = rollouts['rewards']
+            if self.prompt_answer:
+                pass
+            else:
+                ends = start + action_mask[:, start:].sum(1) + 1
+                # we need to zero out the reward and value after the end of the conversation
+                # otherwise the advantage/return will be wrong
+                for i in range(old_rewards.shape[0]):
+                    old_rewards[i, ends[i]:] = 0
+                    old_values[i, ends[i]:] = 0
+            print_rank_0('old_reward' + str(old_rewards), self.args.global_rank)
+            print_rank_0('old_value' + str(old_values), self.args.global_rank)
+            if self.prompt_answer:
+                advantages, returns = self.get_advantages_and_returns(
+                    old_values, old_rewards, start=0)
+            else:
+                advantages, returns = self.get_advantages_and_returns(
+                    old_values, old_rewards, start)
+            print_rank_0('advantages' + str(advantages), self.args.global_rank)
+            print_rank_0('advantages' + str(advantages.shape), self.args.global_rank)
 
         ### process the new outputs
         batch = {'input_ids': seq, "attention_mask": attention_mask}
         actor_prob = self.actor_model(**batch, use_cache=False).logits
         actor_log_prob = gather_log_probs(actor_prob[:, :-1, :], seq[:, 1:])
-        actor_loss = self.actor_loss_fn(actor_log_prob[:, start:],
-                                        log_probs[:, start:], advantages,
-                                        action_mask[:, start:])
+        #new_mask = 
+        if self.prompt_answer:
+            #from alpaca_farm import torch_ops
+            #torch_ops.left_pad(input_ids, (2, 6), value=2)
+            device = prompts.device
+            padding = torch.ones(prompts.shape[0], action_mask.shape[1] - prompts.shape[1]).long() * self.tokenizer.pad_token_id
+            prompts_pad = torch.cat([padding, prompts.cpu()], dim=1)
+            prompts_mask = prompts_pad.not_equal(self.tokenizer.pad_token_id).long()
+            to_be_shift = torch.logical_xor(action_mask.cpu(), prompts_mask.cpu()).long()
+            tmp_arr = [torch.roll(a, [b], dims=0) for a, b in zip(to_be_shift, prompts_mask.cpu().sum(1))]
+            new_mask = torch.stack(tmp_arr, dim=0).to(device)
+            actor_ret = self.actor_loss_fn(actor_log_prob, log_probs, advantages, new_mask)
+        else:
+            actor_ret = self.actor_loss_fn(actor_log_prob[:, start:],
+                                            log_probs[:, start:], advantages,
+                                            action_mask[:, start:])
+        actor_loss = actor_ret['pg_loss']
         self.actor_model.backward(actor_loss)
         self.actor_model.step()
         value = self.critic_model.forward_value(**batch,
                                                 return_value_only=True,
                                                 use_cache=False)[:, :-1]
-        critic_loss = self.critic_loss_fn(value[:, start:], old_values[:,
-                                                                       start:],
-                                          returns, action_mask[:, start:])
-        self.critic_model.backward(critic_loss)
+        if self.prompt_answer:
+            crit_ret = self.critic_loss_fn(value, old_values, returns, new_mask)
+        else:
+            crit_ret = self.critic_loss_fn(value[:, start:], old_values[:,
+                                                                           start:],
+                                              returns, action_mask[:, start:])
+        critic_loss = crit_ret["critic_loss"]
+
+        self.critic_model.backward(critic_loss * self.vf_coef)
         self.critic_model.step()
+
+
+        # Stats
+        stats = crit_ret
+        stats['policy'] = actor_ret
+        stats['loss'] = dict(
+            policy=actor_loss, 
+            value=critic_loss,
+        )
+        from alpaca_farm import common
+        train_stats = common.flatten_dict(stats, sep="/", postprocess_fn=lambda x: x.detach())
+
+        kl = rollouts["kl"]
+        kl_sum_seq, kl_avg_seq = kl.sum(dim=1).mean(dim=0), kl.mean()
+        shaped_rewards = rollouts["shaped_rewards"].sum(dim=1).mean(dim=0)
+        non_score_rewards = rollouts["non_score_rewards"].sum(dim=1).mean(dim=0)
+        rewards = rollouts["rewards"].mean(dim=0)
+        stats = {
+            f"objective/kl_sum_seq": kl_sum_seq,
+            f"objective/kl_avg_seq": kl_avg_seq,
+            f"objective/shaped_rewards": shaped_rewards,
+            f"objective/non_score_rewards": non_score_rewards,
+            f"objective/rewards": rewards,  # Original model reward.
+        }
+        for k, v in train_stats.items():
+            stats[f"ppo/{k}"] = v.mean(dim=0)
+        #stats = {key: value.item() if torch.is_tensor(value) else value for key, value in stats.items()}
+ 
+        for k in stats.keys():
+            try:
+                v = stats[k]
+                if torch.is_tensor(v):
+                    v = v.item()
+                stats[k] = v
+                line = "{}_step: {}".format(k, str(stats[k]))
+                print_rank_0(line, self.args.global_rank)
+            except:
+                print('fail convert', k, v)
+                pass
 
         return actor_loss, critic_loss
 
     def actor_loss_fn(self, logprobs, old_logprobs, advantages, mask):
         ## policy gradient loss
+        print_rank_0('xor_mask' + str(mask), self.args.global_rank)
         log_ratio = (logprobs - old_logprobs) * mask
+        print_rank_0('log_ratio' + str(log_ratio), self.args.global_rank)
         ratio = torch.exp(log_ratio)
-        pg_loss1 = -advantages * ratio
+        print_rank_0('ratio' + str(ratio), self.args.global_rank)
+        pg_loss1 = -advantages * ratio * mask
+        print_rank_0('pg_loss1' + str(pg_loss1), self.args.global_rank)
         pg_loss2 = -advantages * torch.clamp(ratio, 1.0 - self.cliprange,
-                                             1.0 + self.cliprange)
+                                             1.0 + self.cliprange) * mask
+        print_rank_0('pg_loss2' + str(pg_loss2), self.args.global_rank)
         pg_loss = torch.sum(torch.max(pg_loss1, pg_loss2) * mask) / mask.sum()
-        return pg_loss
+
+        approxkl = 0.5 * ((logprobs - old_logprobs) ** 2.0).mean()
+        pg_clipfrac = (pg_loss2 > pg_loss1).to(torch.get_default_dtype()).mean()  # noqa
+        return dict(
+            pg_loss=pg_loss,
+            approxkl=approxkl,
+            clipfrac=pg_clipfrac,
+        )
 
     def critic_loss_fn(self, values, old_values, returns, mask):
         ## value loss
@@ -198,14 +457,36 @@ class DeepSpeedPPOTrainer():
             old_values - self.cliprange_value,
             old_values + self.cliprange_value,
         )
-        vf_loss1 = (values - returns)**2
-        vf_loss2 = (values_clipped - returns)**2
+        print_rank_0('values_clipped' + str(values_clipped), self.args.global_rank)
+        vf_loss1 = (values - returns)**2 * mask
+        print_rank_0('vf_loss1' + str(vf_loss1), self.args.global_rank)
+        vf_loss2 = (values_clipped - returns)**2 * mask
+        print_rank_0('vf_loss2' + str(vf_loss2), self.args.global_rank)
         vf_loss = 0.5 * torch.sum(
             torch.max(vf_loss1, vf_loss2) * mask) / mask.sum()
-        return vf_loss
+
+        # stat
+        vpred = values
+        vf_clipfrac = (vf_loss2 > vf_loss2).to(torch.get_default_dtype()).mean()
+        value_mean, value_var = old_values.mean(), old_values.var(unbiased=False)
+        return_mean, return_var = returns.mean(), returns.var(unbiased=False)
+        return dict(
+            critic_loss=vf_loss,
+            returns=dict(mean=return_mean, var=return_var),
+            val=dict(
+                vpred=vpred.mean(),
+                error=((vpred - returns) ** 2).mean(),
+                clipfrac=vf_clipfrac,
+                mean=value_mean,
+                var=value_var,
+            )
+        )
 
     def get_advantages_and_returns(self, values, rewards, start):
         # Adopted from https://github.com/CarperAI/trlx/blob/main/trlx/models/modeling_ppo.py#L134
+        max_len = self.args.max_prompt_seq_len + self.args.max_answer_seq_len
+        if self.args.use_whiten:
+            rewards = torch_ops.whiten(rewards, shift_mean=False, max_len=max_len)
         lastgaelam = 0
         advantages_reversed = []
         length = rewards.size()[-1]
@@ -216,6 +497,8 @@ class DeepSpeedPPOTrainer():
             advantages_reversed.append(lastgaelam)
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = advantages + values[:, start:]
+        if self.args.use_whiten:
+            advantages = torch_ops.whiten(advantages, shift_mean=True, max_len=max_len)
         return advantages.detach(), returns
 
     def _validate_training_mode(self):

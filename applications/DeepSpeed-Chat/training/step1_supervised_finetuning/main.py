@@ -22,6 +22,7 @@ from transformers import (
     get_scheduler,
 )
 
+from megatron import mpu
 import deepspeed
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 
@@ -147,6 +148,12 @@ def parse_args():
     parser.add_argument('--offload',
                         action='store_true',
                         help='Enable ZeRO Offload techniques.')
+    parser.add_argument('--tensor_parallel',
+                        action='store_true',
+                        help='tp')
+    parser.add_argument('--pipeline_parallel',
+                        action='store_true',
+                        help='pp')
     parser.add_argument(
         '--zero_stage',
         type=int,
@@ -191,7 +198,7 @@ def main():
     args.global_rank = torch.distributed.get_rank()
 
     ds_config = get_train_ds_config(offload=args.offload,
-                                    stage=args.zero_stage)
+                                    stage=args.zero_stage, max_out_tokens=args.max_seq_len)
     ds_config[
         'train_micro_batch_size_per_gpu'] = args.per_device_train_batch_size
     ds_config[
@@ -202,7 +209,7 @@ def main():
     set_random_seed(args.seed)
     print_rank_0('random seed set!')
 
-    assert not args.offload, "zero-offload is not currently supported but coming soon!"
+    #assert not args.offload, "zero-offload is not currently supported but coming soon!"
 
     torch.distributed.barrier()
     print_rank_0('after barrier!')
@@ -225,11 +232,18 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
         print(tokenizer.pad_token, tokenizer.pad_token_id)
 
-    model = create_hf_model(model_class,
-                            args.model_name_or_path,
-                            tokenizer,
-                            ds_config,
-                            disable_dropout=args.disable_dropout)
+    if args.pipeline_parallel:
+        from llama_pipeline_model import get_model
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(args.model_name_or_path)
+        model = get_model(config)
+    else:
+        model = create_hf_model(model_class,
+                                args.model_name_or_path,
+                                tokenizer,
+                                ds_config,
+                                disable_dropout=args.disable_dropout)
+    print_rank_0("***** Model done*****", args.global_rank)
 
     if args.lora_dim > 0:
         model = convert_linear_layer_to_lora(model, args.lora_module_name,
@@ -249,6 +263,10 @@ def main():
         tokenizer,
         args.max_seq_len,
         sft_only_data_path=args.sft_only_data_path)
+    print('train_num', len(train_dataset), 'eval_num', len(eval_dataset))
+    print_rank_0("***** Dataset done*****", args.global_rank)
+
+    init_params = {}
 
     # DataLoaders creation:
     if args.local_rank == -1:
@@ -257,6 +275,26 @@ def main():
     else:
         train_sampler = DistributedSampler(train_dataset)
         eval_sampler = DistributedSampler(eval_dataset)
+
+    if args.tensor_parallel:
+        mpu.initialize_model_parallel(
+            tensor_model_parallel_size_=2,
+            pipeline_model_parallel_size_=1,
+        )
+        init_params['mpu'] = mpu
+        params = {
+            'num_replicas': mpu.get_data_parallel_world_size(),
+            'rank': mpu.get_data_parallel_rank(),
+        }
+        print('dd_params', params)
+        train_sampler = DistributedSampler(train_dataset, **params)
+        eval_sampler = DistributedSampler(eval_dataset, **params)
+
+
+    if args.pipeline_parallel:
+        from llama_pipeline_model import DataCollatorForPromptDataset
+        data_collator = DataCollatorForPromptDataset()
+
     train_dataloader = DataLoader(train_dataset,
                                   collate_fn=default_data_collator,
                                   sampler=train_sampler,
@@ -265,9 +303,13 @@ def main():
                                  collate_fn=default_data_collator,
                                  sampler=eval_sampler,
                                  batch_size=args.per_device_eval_batch_size)
-    for idx, e in enumerate(train_dataloader):
-        if idx < 10:
-            print(idx, e)
+    print_rank_0("***** Dataloader done*****", args.global_rank)
+    #for idx, e in enumerate(train_dataloader):
+    #    if idx < 5:
+    #        pass
+            #print(idx, e)
+            #for k in e.keys():
+            #    print(k, e[k].shape)
 
 
     def evaluation(model, eval_dataloader):
@@ -294,11 +336,14 @@ def main():
     # Split weights in two groups, one with weight decay and the other not.
     optimizer_grouped_parameters = get_optimizer_grouped_parameters(
         model, args.weight_decay)
+    print_rank_0("***** Optim group done*****", args.global_rank)
 
+    print_rank_0(len(train_dataloader), args.global_rank)
     AdamOptimizer = DeepSpeedCPUAdam if args.offload else FusedAdam
     optimizer = AdamOptimizer(optimizer_grouped_parameters,
                               lr=args.learning_rate,
                               betas=(0.9, 0.95))
+    print_rank_0("***** Optim done*****", args.global_rank)
 
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps)
@@ -308,6 +353,7 @@ def main():
         num_warmup_steps=args.num_warmup_steps,
         num_training_steps=args.num_train_epochs * num_update_steps_per_epoch,
     )
+    print_rank_0("***** Lr scheduler group done*****", args.global_rank)
 
     model, optimizer, _, lr_scheduler = deepspeed.initialize(
         model=model,
@@ -315,7 +361,8 @@ def main():
         args=args,
         config=ds_config,
         lr_scheduler=lr_scheduler,
-        dist_init_required=True)
+        dist_init_required=True,
+        **init_params)
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -325,8 +372,8 @@ def main():
     print_rank_0(
         f"***** Evaluating perplexity, Epoch {0}/{args.num_train_epochs} *****",
         args.global_rank)
-    perplexity = evaluation(model, eval_dataloader)
-    print_rank_0(f"ppl: {perplexity}", args.global_rank)
+    #perplexity = evaluation(model, eval_dataloader)
+    #print_rank_0(f"ppl: {perplexity}", args.global_rank)
 
     for epoch in range(args.num_train_epochs):
         print_rank_0(
@@ -334,13 +381,38 @@ def main():
             args.global_rank)
         model.train()
         epoch_iterator = tqdm(train_dataloader, disable=args.global_rank != 0)
+        save_per_step = 1000
+        #loader = iter(deepspeed.utils.RepeatingLoader(train_dataloader))
+        #for step in range(1000):
         for step, batch in enumerate(epoch_iterator):
+            if step < 10:
+                print_rank_0('to_device', args.global_rank)
             batch = to_device(batch, device)
+            if step < 10:
+                print_rank_0('after to_device', args.global_rank)
             outputs = model(**batch, use_cache=False)
             loss = outputs.loss
+            """
+            loss = model.train_batch(data_iter=loader)
+            """
+
             epoch_iterator.set_postfix({'loss': loss.item()})  #
             model.backward(loss)
             model.step()
+
+            if step > 0 and step % save_per_step == 0:
+                if args.global_rank == 0:
+                    save_hf_format(model, tokenizer, args)
+
+                if args.zero_stage == 3:
+                    # For zero stage 3, each gpu only has a part of the model, so we need a special save function
+                    save_zero_three_model(model,
+                                          args.global_rank,
+                                          args.output_dir,
+                                          zero_stage=args.zero_stage)
+
+        if args.global_rank == 0:
+            save_hf_format(model, tokenizer, args)
 
         if args.zero_stage == 3:
             # For zero stage 3, each gpu only has a part of the model, so we need a special save function
@@ -353,13 +425,14 @@ def main():
         print_rank_0(
             f"***** Evaluating perplexity, Epoch {epoch+1}/{args.num_train_epochs} *****",
             args.global_rank)
-        perplexity = evaluation(model, eval_dataloader)
+        #perplexity = evaluation(model, eval_dataloader)
+        perplexity = 0.0
         print_rank_0(f"ppl: {perplexity}", args.global_rank)
         model.tput_timer.update_epoch_count()
 
     if args.output_dir is not None:
-        print_rank_0('saving the final model ...', args.global_rank, args.output_dir)
-        model = convert_lora_to_linear_layer(model)
+        print_rank_0('saved the final model to {}...'.format(args.output_dir), args.global_rank)
+        #model = convert_lora_to_linear_layer(model)
 
         if args.global_rank == 0:
             save_hf_format(model, tokenizer, args)
@@ -372,8 +445,21 @@ def main():
                                   zero_stage=args.zero_stage)
 
         torch.distributed.barrier()
-        print_rank_0('saved the final model ...', args.global_rank, args.output_dir)
+        print_rank_0('saved the final model to {}...'.format(args.output_dir), args.global_rank)
+
+        if args.global_rank == 0:
+            output_dir = args.output_dir + '_ds'
+            model.save_checkpoint(output_dir)
+
+            model = AutoModelForCausalLM.from_pretrained(args.output_dir)
+            args.output_dir = args.output_dir + '_split'
+            save_hf_format(model, tokenizer, args)
+            model.save_pretrained(args.output_dir, max_shard_size='2GB')
+
+
+        torch.distributed.barrier()
 
 
 if __name__ == "__main__":
     main()
+

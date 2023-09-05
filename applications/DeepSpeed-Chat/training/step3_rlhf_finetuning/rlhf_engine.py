@@ -74,7 +74,9 @@ class DeepSpeedRLHFEngine():
             pin_parameters=(not self.args.unpin_actor_parameters),
             tp_gather_partition_size=self.args.tp_gather_partition_size,
             max_out_tokens=self.args.max_prompt_seq_len +
-            self.args.max_answer_seq_len)
+            self.args.max_answer_seq_len,
+            #initial_scale_power=0,
+            )
         ds_config[
             'train_micro_batch_size_per_gpu'] = self.args.per_device_mini_train_batch_size
         #TODO(jeff): we should probably set grad accumlation steps here as well for clarity
@@ -103,6 +105,7 @@ class DeepSpeedRLHFEngine():
         optim_params = get_optimizer_grouped_parameters(
             actor_model, self.args.actor_weight_decay)
         optim = AdamOptimizer(optim_params,
+                              eps=1e-5,
                               lr=self.args.actor_learning_rate,
                               betas=(0.9, 0.95))
 
@@ -144,9 +147,44 @@ class DeepSpeedRLHFEngine():
         ref_model = create_hf_model(AutoModelForCausalLM,
                                     actor_model_name_or_path, self.tokenizer,
                                     ds_config)
+        if True:
+            if False:
+                import deepspeed.module_inject as module_inject
+                from transformers.models.llama.modeling_llama import LlamaForCausalLM
+                from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+                injection_policy = { LlamaForCausalLM: (module_inject.replace_policy.LLAMALayerPolicy, ) }
+                #injection_policy = { LlamaDecoderLayer: ('self_attn.o_proj', 'mlp.down_proj')}
+                injection_policy = { LlamaDecoderLayer: ('mlp.down_proj')}
+                ds_config = {
+                    'dtype': 'fp16',
+                    'zero': {
+                        'stage': 3,
+                        #'offload_param': {
+                        #    'device': 'cpu',
+                        #},
+                    },
+                    "tensor_parallel": {"tp_size": 4},
+                    'replace_with_kernel_inject': True,
+                    #'injection_policy': injection_policy,
+                    #'injection_policy_tuple': (injection_policy, ),
+                }
 
-        ref_engine, *_ = deepspeed.initialize(model=ref_model,
-                                              config=ds_config)
+                ref_engine = deepspeed.init_inference(
+                    model=ref_model,
+                    config=ds_config,
+                )
+            else:
+                ref_engine, *_ = deepspeed.initialize(
+                    model=ref_model,
+                    config=ds_config,
+                )
+
+        else:
+            class ref_engine:
+                module = None
+                def eval():
+                    pass
+            ref_engine.module = ref_model
 
         log_init("Ref", stime=stime)
         return ref_engine
@@ -203,7 +241,9 @@ class DeepSpeedRLHFEngine():
             ds_config=ds_eval_config,
             num_padding_at_beginning=self.args.num_padding_at_beginning,
             rlhf_training=True,
-            disable_dropout=self.args.disable_critic_dropout)
+            disable_dropout=self.args.disable_critic_dropout,
+            alpaca_reward_model=self.args.load_alpaca_reward_model,
+        )
 
         # LoRA
         if self.args.critic_lora_dim > 0:
@@ -264,7 +304,9 @@ class DeepSpeedRLHFEngine():
             tokenizer=self.tokenizer,
             ds_config=ds_eval_config,
             num_padding_at_beginning=self.args.num_padding_at_beginning,
-            rlhf_training=True)
+            rlhf_training=True,
+            alpaca_reward_model=self.args.load_alpaca_reward_model,
+        )
 
         reward_engine, *_ = deepspeed.initialize(model=reward_model,
                                                  config=ds_config)

@@ -11,9 +11,9 @@ import deepspeed
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 
 
-def print_rank_0(msg, rank=0):
+def print_rank_0(msg, rank=0, *args, **kwargs):
     if rank <= 0:
-        print(msg)
+        print(msg, *args, **kwargs)
 
 
 def to_device(batch, device):
@@ -41,12 +41,15 @@ class MovingAverage:
         return self.mean
 
 
-def save_hf_format(model, tokenizer, args, sub_folder=""):
+def save_hf_format(model, tokenizer, args=None, sub_folder="", save_dir=None):
     # used to save huggingface format, so we can use it for hf.from_pretrained
     model_to_save = model.module if hasattr(model, 'module') else model
     CONFIG_NAME = "config.json"
     WEIGHTS_NAME = "pytorch_model.bin"
-    output_dir = os.path.join(args.output_dir, sub_folder)
+    if save_dir is not None:
+        output_dir = save_dir
+    else:
+        output_dir = os.path.join(args.output_dir, sub_folder)
     os.makedirs(output_dir, exist_ok=True)
     output_model_file = os.path.join(output_dir, WEIGHTS_NAME)
     output_config_file = os.path.join(output_dir, CONFIG_NAME)
