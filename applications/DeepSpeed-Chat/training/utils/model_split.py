@@ -20,6 +20,9 @@ def _main():
         from alpaca_farm.models.reward_model import RewardConfig
         config = RewardConfig.from_pretrained(os.path.join(model_name, 'config.json.alpaca'))
         print(config)
+        if not os.path.exists(output_name):
+            os.makedirs(output_name)
+        config.to_json_file(os.path.join(output_name, 'config.json.alpaca'))
     else:
         config = AutoConfig.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)

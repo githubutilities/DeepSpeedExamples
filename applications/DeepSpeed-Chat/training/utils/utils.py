@@ -11,8 +11,8 @@ import deepspeed
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 
 
-def print_rank_0(msg, rank=0, *args, **kwargs):
-    if rank <= 0:
+def print_rank_0(msg, *args, rank=0, **kwargs):
+    if isinstance(rank, int) and rank <= 0:
         print(msg, *args, **kwargs)
 
 

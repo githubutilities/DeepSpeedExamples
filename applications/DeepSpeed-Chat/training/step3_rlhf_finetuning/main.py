@@ -200,6 +200,16 @@ def parse_args():
                         default=-1,
                         help="local_rank for distributed training on gpus")
     parser.add_argument(
+        "--prompt_dict_path",
+        type=str,
+        default="",
+    )
+    parser.add_argument(
+        "--debug",
+        action='store_true',
+        default=False,
+    )
+    parser.add_argument(
         "--prompt_answer",
         action='store_true',
         default=False,
@@ -213,6 +223,21 @@ def parse_args():
         "--use_whiten",
         action='store_true',
         default=False,
+    )
+    parser.add_argument(
+        "--use_scale_value",
+        action='store_true',
+        default=False,
+    )
+    parser.add_argument(
+        "--scale_value_std",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--scale_value_mean",
+        type=float,
+        default=0.0,
     )
     parser.add_argument(
         "--use_scale_reward",
@@ -385,10 +410,15 @@ def save_rlhf_models(rlhf_engine, tokenizer, output_dir, args):
 
 def create_datasets(args, tokenizer, train_phase=3):
     unsupervised_training_enabled = args.unsupervised_dataset_name and args.unsupervised_dataset_config_name
+    import alpaca_farm.utils
+    if os.path.exists(args.prompt_dict_path):
+        prompt_dict = alpaca_farm.utils.jload(args.prompt_dict_path)
+    else:
+        prompt_dict = {"prompt_inputs": "{instruction}\n{input}"}
     prompt_train_dataset, _ = create_prompt_dataset(
         args.local_rank, args.data_path, args.data_split,
         args.data_output_path, train_phase, args.seed, tokenizer,
-        args.max_prompt_seq_len)
+        args.max_prompt_seq_len, prompt_dict=prompt_dict)
     if unsupervised_training_enabled:
         unsupervised_train_dataset = get_unsupervised_data(args, tokenizer)
     else:
@@ -486,18 +516,19 @@ def main():
                                      args.per_device_mini_train_batch_size)
 
     # Train!
-    print_rank_0("***** Running training *****", args.global_rank)
+    print_rank_0("***** Running training *****", rank=args.global_rank)
 
+    total_step = 0
     for epoch in range(args.num_train_epochs):
         print_rank_0(
             f"Beginning of Epoch {epoch+1}/{args.num_train_epochs}, Total Generation Batches {min(len(prompt_train_dataloader), len(unsupervised_train_dataloader))}",
-            args.global_rank)
+            rank=args.global_rank)
         for step, (batch_prompt, batch_unsupervised) in tqdm.tqdm(
             enumerate(zip(prompt_train_dataloader, unsupervised_train_dataloader)),
             disable=torch.distributed.get_rank() != 0,
             desc="total_step",
         ):
-            print_rank_0("Time before to_device: {}".format(int(time.time())), args.global_rank)
+            print_rank_0("Time before to_device: {}".format(int(time.time())), rank=args.global_rank)
             batch_prompt = to_device(batch_prompt, device)
             if batch_unsupervised is not None:
                 batch_unsupervised = to_device(batch_unsupervised, device)
@@ -511,10 +542,10 @@ def main():
             #    prompts = prompts[:, length - args.max_prompt_seq_len:]
             #    raise ValueError("Prompt length is too long")
 
-            print_rank_0("Time before generate_exp: {}".format(int(time.time())), args.global_rank)
+            print_rank_0("Time before generate_exp: {}".format(int(time.time())), rank=args.global_rank)
             out = trainer.generate_experience(batch_prompt['prompt'],
                 batch_prompt['prompt_att_mask'], step_idx=step)
-            print_rank_0("Time after generate_exp: {}".format(int(time.time())), args.global_rank)
+            print_rank_0("Time after generate_exp: {}".format(int(time.time())), rank=args.global_rank)
             exp_dataset = exp_mini_dataset.add(out)
 
             if exp_dataset is not None:
@@ -532,28 +563,28 @@ def main():
                             disable=torch.distributed.get_rank() != 0,
                             desc="train_step",
                     ):
-                        print_rank_0("exp: i {}".format(i), args.global_rank)
-                        print_rank_0("Time before train_rlhf: {}".format(int(time.time())), args.global_rank)
+                        print_rank_0("exp: i {}".format(i), rank=args.global_rank)
+                        print_rank_0("Time before train_rlhf: {}".format(int(time.time())), rank=args.global_rank)
                         actor_loss, critic_loss = trainer.train_rlhf(exp_data)
-                        print_rank_0("cur_actor_loss: {}".format(actor_loss), args.global_rank)
-                        print_rank_0("cur_critic_loss: {}".format(critic_loss), args.global_rank)
-                        print_rank_0("Time after train_rlhf: {}".format(int(time.time())), args.global_rank)
+                        print_rank_0("cur_actor_loss: {}".format(actor_loss), rank=args.global_rank)
+                        print_rank_0("cur_critic_loss: {}".format(critic_loss), rank=args.global_rank)
+                        print_rank_0("Time after train_rlhf: {}".format(int(time.time())), rank=args.global_rank)
                         actor_loss_sum += actor_loss.item()
                         critic_loss_sum += critic_loss.item()
                         cur_reward_score = exp_data["rewards"].mean()
                         print_rank_0("cur_reward_score: {}".format(cur_reward_score),
-                            args.global_rank)
+                            rank=args.global_rank)
                         # clip cur reward
                         #cur_reward_score = max(cur_reward_score, -1.0)
                         average_reward += cur_reward_score
          
                         #if i > 0 and i % update_per_step == 0:
                         if False:
-                            print_rank_0("Time before copy_model: {}".format(int(time.time())), args.global_rank)
+                            print_rank_0("Time before copy_model: {}".format(int(time.time())), rank=args.global_rank)
                             copy_model(rlhf_engine.actor,
                                            rlhf_engine.ref,
                                            zero_stage=args.actor_zero_stage)
-                            print_rank_0("Time after copy_model: {}".format(int(time.time())), args.global_rank)
+                            print_rank_0("Time after copy_model: {}".format(int(time.time())), rank=args.global_rank)
 
                         if unsupervised_training_enabled:
                             unsup_loss = trainer.train_unsupervised(
@@ -571,21 +602,22 @@ def main():
 
                 print_rank_0(
                     f'epoch: {epoch}|step: {step}|ppo_ep: {ppo_ep+1}|act_loss: {actor_loss_sum/inner_iter}|cri_loss: {critic_loss_sum/inner_iter}|unsuper_loss: {unsup_loss_sum/inner_iter}',
-                    args.global_rank)
+                    rank=args.global_rank)
                 average_reward = get_all_reduce_mean(average_reward).item()
                 print_rank_0(
                     f"average reward score: {average_reward/inner_iter}",
-                    args.global_rank)
+                    rank=args.global_rank)
                 print_rank_0(
                     "-------------------------------------------------------------------------------------",
-                    args.global_rank)
+                    rank=args.global_rank)
 
             if args.actor_gradient_checkpointing:
                 rlhf_engine.actor.gradient_checkpointing_disable()
 
-            if step == 1 or step % args.save_per_step == 0:
-                output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(step))
+            if total_step == 1 or step % args.save_per_step == 0:
+                output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(total_step))
                 save_rlhf_models(rlhf_engine, tokenizer, output_dir, args)
+            total_step += 1
 
     if args.output_dir is not None:
         print_rank_0('saving model ...')

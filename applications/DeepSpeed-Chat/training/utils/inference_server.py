@@ -34,6 +34,11 @@ def parse_args():
         required=True,
     )
     parser.add_argument(
+        "--serving_name",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
         "--start_flask",
         action='store_true',
         default=False,
@@ -411,7 +416,7 @@ def main():
         if local_rank == 0:
             #start server
             print('starting server------------')
-            model_name = os.path.basename(model_dir.rstrip(os.sep))
+            model_name = os.path.basename(model_dir.rstrip(os.sep)) if args.serving_name is None else args.serving_name
             with open('/etc/hosts') as f:
                 ip = [l.split()[0] for l in f if l.strip() != ''][-1]
                 port = random.randint(8090, 10000)

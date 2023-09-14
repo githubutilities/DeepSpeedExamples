@@ -8,7 +8,8 @@ cd "$(dirname "${BASH_SOURCE}")"/..;
 # You can provide two models to compare the performance of the baseline and the finetuned model
 
 ps -ef | grep trainer | grep -v grep | tee /dev/stderr | awk '{print $2}' | xargs kill -9
-#source ./utils/env.sh
+set -x
+source ./utils/env.sh
 
 bash ./scripts/web_demo.sh &
 #python -m accelerate.commands.accelerate_cli launch \
@@ -21,11 +22,7 @@ echo $visible_device
 args="--start_flask"
 port=$(echo $((20000 + $RANDOM % 1000)))
 #    --num_gpus $num_gpu \
-if [ $num_gpu == 1 ]; then
-    launch_cmd="python -m deepspeed.launcher.runner "
-else
-    launch_cmd="python "
-fi
+launch_cmd="python -m deepspeed.launcher.runner "
 $launch_cmd \
     --include localhost:$visible_device \
     --master_addr 127.0.0.1 \

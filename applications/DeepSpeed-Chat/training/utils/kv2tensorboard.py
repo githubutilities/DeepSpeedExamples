@@ -44,7 +44,7 @@ def _main():
                 print(str(e))
                 pass
         #tsv
-        if True and len(l) <= 30:
+        if True and len(l) <= 50:
             l_sp = l.replace(':', '\t').rstrip('\n').split('\t')
             if len(l_sp) < 2:
                 continue

@@ -81,6 +81,42 @@ class SftDataset(PromptRawDataset):
         return self.get_prompt(sample) + self.get_rejected(sample)
 
 
+# Alpaca dataset
+class AlpacaDataset(PromptRawDataset):
+
+    def __init__(self, output_path, seed, local_rank, dataset_name, train_phase, prompt):
+        #super().__init__(output_path, seed, local_rank, dataset_name)
+        self.prompt = prompt
+        self.chosen_field = 'output'
+        with open(os.path.join(dataset_name, 'unlabeled.json')) as f:
+            self.train_data = [json.loads(l) for l in f]
+            self.train_data = [e for e in self.train_data if e[self.chosen_field] is not None]
+        with open(os.path.join(dataset_name, 'val.json')) as f:
+            self.test_data = [json.loads(l) for l in f]
+            self.test_data = [e for e in self.test_data if e[self.chosen_field] is not None]
+        self.dataset_name = os.path.basename(dataset_name)
+        self.dataset_name_clean = os.path.basename(dataset_name)
+
+    def get_train_data(self):
+        return self.train_data
+
+    def get_eval_data(self):
+        return self.test_data
+
+    def get_prompt(self, sample):
+        ret = self.prompt.format(**{
+            'instruction': sample['instruction'],
+            'input': sample['input'],
+        })
+        return ret
+
+    def get_chosen(self, sample):
+        return sample[self.chosen_field]
+
+    def get_prompt_and_chosen(self, sample):
+        return self.get_prompt(sample) + self.get_chosen(sample)
+
+
 # English dataset
 class DahoasRmstaticDataset(PromptRawDataset):
 

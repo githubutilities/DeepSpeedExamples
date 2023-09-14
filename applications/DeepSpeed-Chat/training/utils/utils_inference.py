@@ -88,8 +88,31 @@ def load_model_on_gpus(checkpoint_path: Union[str, os.PathLike], num_gpus: int =
     kwargs['torch_dtype'] = torch.float16
     kwargs['offload_state_dict'] = True
     kwargs['trust_remote_code'] = True
+    try:
+        config = AutoConfig.from_pretrained(checkpoint_path)
+        if True:
+            model = model_class.from_pretrained(checkpoint_path, **kwargs).half()
+        else:
+            config = AutoConfig.from_pretrained(checkpoint_path, **kwargs)
+            model = model_class.from_config(config).half()
+    except:
+        from alpaca_farm.models.reward_model import RewardConfig
+        from alpaca_farm.models.reward_model import RewardModel
+        config = RewardConfig.from_pretrained(checkpoint_path)
+        critic_model = RewardModel.from_pretrained(checkpoint_path, 
+            flash_attn=False,
+            fp16=True,
+            bf16=False,
+            low_cpu_mem_usage=True,
+            device_map=None,
+            config=config,
+        )
+        model = critic_model
+    model.eval()
+
     if num_gpus < 2 and device_map is None:
-        model = model_class.from_pretrained(checkpoint_path, **kwargs).half().cuda()
+        #model = model_class.from_pretrained(checkpoint_path, **kwargs).half().cuda()
+        model = model.cuda()
     elif True:
         import deepspeed
         import deepspeed.module_inject as module_inject
@@ -102,27 +125,6 @@ def load_model_on_gpus(checkpoint_path: Union[str, os.PathLike], num_gpus: int =
             if False:
                 kwargs['device_map'] = auto_configure_llama_device_map_disk()
                 kwargs['offload_folder'] = '/tmp/offload'
-            try:
-                config = AutoConfig.from_pretrained(checkpoint_path)
-                if True:
-                    model = model_class.from_pretrained(checkpoint_path, **kwargs).half()
-                else:
-                    config = AutoConfig.from_pretrained(checkpoint_path, **kwargs)
-                    model = model_class.from_config(config).half()
-            except:
-                from alpaca_farm.models.reward_model import RewardConfig
-                from alpaca_farm.models.reward_model import RewardModel
-                config = RewardConfig.from_pretrained(checkpoint_path)
-                critic_model = RewardModel.from_pretrained(checkpoint_path, 
-                    flash_attn=False,
-                    fp16=True,
-                    bf16=False,
-                    low_cpu_mem_usage=True,
-                    device_map=None,
-                    config=config,
-                )
-                model = critic_model
-        model.eval()
         injection_policy = { LlamaForCausalLM: module_inject.replace_policy.LLAMALayerPolicy }
         world_size = num_gpus
         print(world_size, 'world_size')
@@ -138,14 +140,23 @@ def load_model_on_gpus(checkpoint_path: Union[str, os.PathLike], num_gpus: int =
             #'injection_policy': injection_policy,
             'injection_policy_tuple': (injection_policy, ),
         }
-        model = deepspeed.init_inference(
-            model,
-            config=config,
-            #zero=zero,
-            mp_size=world_size,
+        if False:
+            init_fn = deepspeed.initialize
+            init_kwargs = {}
+        else:
+            init_fn = deepspeed.init_inference
+            init_kwargs = {
+                'config': config,
+                'mp_size': world_size,
+            }
+        model = init_fn(
+            model=model,
+            #config=config,
+            #mp_size=world_size,
             #dtype=torch.float16,
             #injection_policy=injection_policy,
             #replace_with_kernel_inject=True,
+            **init_kwargs,
         )
     else:
         from accelerate import init_empty_weights

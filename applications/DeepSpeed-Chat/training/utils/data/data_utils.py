@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import Dataset, Subset, ConcatDataset
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
+import datasets
 from datasets import load_dataset
 import numpy as np
 import os
@@ -17,9 +18,12 @@ from itertools import chain
 from . import raw_datasets
 
 
-def get_raw_dataset(dataset_name, output_path, seed, local_rank):
+def get_raw_dataset(dataset_name, output_path, seed, local_rank, train_phase=None, prompt_dict={}):
     if 'sft' in dataset_name:
         return raw_datasets.SftDataset(output_path, seed, local_rank, dataset_name)
+    elif train_phase == 3 and 'alpaca' in dataset_name:
+        # alpaca dataset support
+        return raw_datasets.AlpacaDataset(output_path, seed, local_rank, dataset_name, train_phase=train_phase, prompt=prompt_dict.get("prompt_inputs", "{instruction}\n{input}"))
     elif "Dahoas/rm-static" in dataset_name:
         return raw_datasets.DahoasRmstaticDataset(output_path, seed,
                                                   local_rank, dataset_name)
@@ -227,8 +231,9 @@ def create_dataset_split(current_dataset, raw_dataset, train_phase, tokenizer,
 
 def create_dataset(local_rank, dataset_name, data_split, output_path,
                    train_phase, seed, tokenizer, end_of_conversation_token,
-                   max_seq_len):
-    raw_dataset = get_raw_dataset(dataset_name, output_path, seed, local_rank)
+                   max_seq_len, prompt_dict={}):
+    print('prompt_dict', prompt_dict)
+    raw_dataset = get_raw_dataset(dataset_name, output_path, seed, local_rank, train_phase=train_phase, prompt_dict=prompt_dict)
     train_dataset = raw_dataset.get_train_data()
     train_index = get_raw_dataset_split_index(local_rank, output_path,
                                               raw_dataset.dataset_name_clean,
@@ -264,7 +269,8 @@ def create_prompt_dataset(local_rank,
                           max_seq_len,
                           #end_of_conversation_token="<|endoftext|>",
                           end_of_conversation_token="",
-                          sft_only_data_path=[]):
+                          sft_only_data_path=[],
+                          prompt_dict={}):
     """
     Creates the prompt dataset
     """
@@ -288,7 +294,7 @@ def create_prompt_dataset(local_rank,
         if len(data_path) == 1:  # Single dataset.
             train_dataset, eval_dataset = create_dataset(
                 local_rank, data_path[0], data_split, output_path, train_phase,
-                seed, tokenizer, end_of_conversation_token, max_seq_len)
+                seed, tokenizer, end_of_conversation_token, max_seq_len, prompt_dict=prompt_dict)
         else:  # Blending datasets.
             train_datasets = []
             eval_datasets = []
@@ -297,7 +303,7 @@ def create_prompt_dataset(local_rank,
             for d_path in data_path:
                 train_dataset, eval_dataset = create_dataset(
                     local_rank, d_path, data_split, output_path, train_phase,
-                    seed, tokenizer, end_of_conversation_token, max_seq_len)
+                    seed, tokenizer, end_of_conversation_token, max_seq_len, prompt_dict=prompt_dict)
                 train_datasets.append(train_dataset)
                 eval_datasets.append(eval_dataset)
                 train_size += len(train_dataset)
@@ -326,6 +332,7 @@ def create_prompt_dataset(local_rank,
                     tokenizer,
                     end_of_conversation_token,
                     max_seq_len,
+                    prompt_dict=prompt_dict,
                 )
                 sft_train_datasets.append(sft_train_dataset)
                 sft_eval_datasets.append(sft_eval_dataset)
@@ -398,9 +405,30 @@ class DataCollatorRLHF:
         return batch
 
 
+def load_my_dataset(dataset_path, dataset_name, split_list):
+    if os.path.exists( dataset_name ):
+        data_files = {}
+        for split in split_list:
+            fn = os.path.join(dataset_name, split)
+            data_files[split] = fn.rstrip(os.sep) + '.json'
+        d = datasets.load_dataset("json", data_files=data_files)
+        def concat_cols(x):
+            template = '{instruction}\n{input}\n{output}'
+            ret = {'text': template.format(**x)}
+            return ret
+        d = d.map(concat_cols)
+        t = datasets.concatenate_datasets(d.values())
+        t = t.remove_columns([col for col in t.column_names if col != "text"])
+        ret = datasets.DatasetDict(train=t)
+    else:
+        ret = datasets.load_dataset(dataset_path, dataset_name)
+    return ret
+
+
 def get_unsupervised_data(args, tokenizer):
-    unsupervised_raw_datasets = load_dataset(
-        args.unsupervised_dataset_name, args.unsupervised_dataset_config_name)
+    #unsupervised_raw_datasets = load_dataset(
+    unsupervised_raw_datasets = load_my_dataset(
+        args.unsupervised_dataset_name, args.unsupervised_dataset_config_name, ["ptx"])
     column_names = unsupervised_raw_datasets["train"].column_names
     text_column_name = "text" if "text" in column_names else column_names[0]
 
