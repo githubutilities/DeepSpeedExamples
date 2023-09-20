@@ -89,7 +89,7 @@ def load_model_on_gpus(checkpoint_path: Union[str, os.PathLike], num_gpus: int =
     kwargs['offload_state_dict'] = True
     kwargs['trust_remote_code'] = True
     try:
-        config = AutoConfig.from_pretrained(checkpoint_path)
+        config = AutoConfig.from_pretrained(checkpoint_path, trust_remote_code=True)
         if True:
             model = model_class.from_pretrained(checkpoint_path, **kwargs).half()
         else:
@@ -173,7 +173,7 @@ def load_model_on_gpus(checkpoint_path: Union[str, os.PathLike], num_gpus: int =
 
             model = dispatch_model(model, device_map=device_map)
         else:
-            config = AutoConfig.from_pretrained(checkpoint_path)
+            config = AutoConfig.from_pretrained(checkpoint_path, trust_remote_code=True)
 
             with init_empty_weights():
                 model = AutoModelForCausalLM.from_config(config)

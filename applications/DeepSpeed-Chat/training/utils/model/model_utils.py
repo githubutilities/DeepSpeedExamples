@@ -87,6 +87,7 @@ def create_critic_model(model_name_or_path,
             tokenizer=tokenizer,
             #offload_state_dict=True,
             low_cpu_mem_usage=True,
+            trust_remote_code=True,
             #device_map={"": torch.cuda.current_device()},
         )
         #critic_model = RewardModelAlpaca.from_pretrained(model_name_or_path,
